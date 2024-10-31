@@ -1,4 +1,3 @@
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -6,26 +5,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from torch.nn.attention import sdpa_kernel, SDPBackend
-
-from .context_parallel import all_to_all_collect_tokens, all_to_all_collect_heads, all_gather, get_cp_rank_size, is_cp_active
 from .layers import (
     FeedForward,
     PatchEmbed,
     RMSNorm,
     TimestepEmbedder,
 )
+
 from .mod_rmsnorm import modulated_rmsnorm
-from .residual_tanh_gated_rmsnorm import (
-    residual_tanh_gated_rmsnorm,
-)
+from .residual_tanh_gated_rmsnorm import (residual_tanh_gated_rmsnorm)
 from .rope_mixed import (
     compute_mixed_rotation,
     create_position_matrix,
 )
 from .temporal_rope import apply_rotary_emb_qk_real
 from .utils import (
-    AttentionPool,
+    pool_tokens,
     modulate,
     pad_and_split_xy,
     unify_streams,
@@ -42,17 +37,81 @@ try:
 except ImportError:
     SAGEATTN_IS_AVAILABLE = False
 
-COMPILE_FINAL_LAYER = False #os.environ.get("COMPILE_DIT") == "1"
-COMPILE_MMDIT_BLOCK = False #os.environ.get("COMPILE_DIT") == "1"
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 backends = []
-if torch.cuda.get_device_properties(0).major <= 7.5:
-    backends.append(SDPBackend.MATH)
-if torch.cuda.get_device_properties(0).major >= 9.0:
-    backends.append(SDPBackend.CUDNN_ATTENTION)
-else:
-    backends.append(SDPBackend.EFFICIENT_ATTENTION)
+backends.append(SDPBackend.CUDNN_ATTENTION)
+backends.append(SDPBackend.EFFICIENT_ATTENTION)
+backends.append(SDPBackend.MATH)
 
+import comfy.model_management as mm
+
+class AttentionPool(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        output_dim: int = None,
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Args:
+            spatial_dim (int): Number of tokens in sequence length.
+            embed_dim (int): Dimensionality of input tokens.
+            num_heads (int): Number of attention heads.
+            output_dim (int): Dimensionality of output tokens. Defaults to embed_dim.
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.to_kv = nn.Linear(embed_dim, 2 * embed_dim, device=device)
+        self.to_q = nn.Linear(embed_dim, embed_dim, device=device)
+        self.to_out = nn.Linear(embed_dim, output_dim or embed_dim, device=device)
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): (B, L, D) tensor of input tokens.
+            mask (torch.Tensor): (B, L) boolean tensor indicating which tokens are not padding.
+
+        NOTE: We assume x does not require gradients.
+
+        Returns:
+            x (torch.Tensor): (B, D) tensor of pooled tokens.
+        """
+        D = x.size(2)
+
+        # Construct attention mask, shape: (B, 1, num_queries=1, num_keys=1+L).
+        attn_mask = mask[:, None, None, :].bool()  # (B, 1, 1, L).
+        attn_mask = F.pad(attn_mask, (1, 0), value=True)  # (B, 1, 1, 1+L).
+
+        # Average non-padding token features. These will be used as the query.
+        x_pool = pool_tokens(x, mask, keepdim=True)  # (B, 1, D)
+
+        # Concat pooled features to input sequence.
+        x = torch.cat([x_pool, x], dim=1)  # (B, L+1, D)
+
+        # Compute queries, keys, values. Only the mean token is used to create a query.
+        kv = self.to_kv(x)  # (B, L+1, 2 * D)
+        q = self.to_q(x[:, 0])  # (B, D)
+
+        # Extract heads.
+        head_dim = D // self.num_heads
+        kv = kv.unflatten(2, (2, self.num_heads, head_dim))  # (B, 1+L, 2, H, head_dim)
+        kv = kv.transpose(1, 3)  # (B, H, 2, 1+L, head_dim)
+        k, v = kv.unbind(2)  # (B, H, 1+L, head_dim)
+        q = q.unflatten(1, (self.num_heads, head_dim))  # (B, H, head_dim)
+        q = q.unsqueeze(2)  # (B, H, 1, head_dim)
+
+        # Compute attention.
+        with sdpa_kernel(backends):
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0
+            )  # (B, H, 1, head_dim)
+
+        # Concatenate heads and run output.
+        x = x.squeeze(2).flatten(1, 2)  # (B, D = H * head_dim)
+        x = self.to_out(x)
+        return x
 
 class AsymmetricAttention(nn.Module):
     def __init__(
@@ -81,6 +140,7 @@ class AsymmetricAttention(nn.Module):
         self.attend_to_padding = attend_to_padding
         self.softmax_scale = softmax_scale
         self.attention_mode = attention_mode
+        self.device = device
         if dim_x % num_heads != 0:
             raise ValueError(
                 f"dim_x={dim_x} should be divisible by num_heads={num_heads}"
@@ -108,25 +168,13 @@ class AsymmetricAttention(nn.Module):
         )
 
     def run_qkv_y(self, y):
-        cp_rank, cp_size = get_cp_rank_size()
-        local_heads = self.num_heads // cp_size
-
-        if is_cp_active():
-            # Only predict local heads.
-            assert not self.qkv_bias
-            W_qkv_y = self.qkv_y.weight.view(
-                3, self.num_heads, self.head_dim, self.dim_y
-            )
-            W_qkv_y = W_qkv_y.narrow(1, cp_rank * local_heads, local_heads)
-            W_qkv_y = W_qkv_y.reshape(3 * local_heads * self.head_dim, self.dim_y)
-            qkv_y = F.linear(y, W_qkv_y, None)  # (B, L, 3 * local_h * head_dim)
-        else:
-            qkv_y = self.qkv_y(y)  # (B, L, 3 * dim)
-
+        local_heads = self.num_heads
+        qkv_y = self.qkv_y(y)  # (B, L, 3 * dim)
         qkv_y = qkv_y.view(qkv_y.size(0), qkv_y.size(1), 3, local_heads, self.head_dim)
         q_y, k_y, v_y = qkv_y.unbind(2)
         return q_y, k_y, v_y
-
+    
+   
     def prepare_qkv(
         self,
         x: torch.Tensor,  # (B, N, dim_x)
@@ -143,10 +191,13 @@ class AsymmetricAttention(nn.Module):
 
         # Process visual features
         qkv_x = self.qkv_x(x)  # (B, M, 3 * dim_x)
-        assert qkv_x.dtype == torch.bfloat16
-        qkv_x = all_to_all_collect_tokens(
-            qkv_x, self.num_heads
-        )  # (3, B, N, local_h, head_dim)
+        #assert qkv_x.dtype == torch.bfloat16
+        
+        # Move QKV dimension to the front.
+        #   B M (3 H d) -> 3 B M H d
+        B, M, _ = qkv_x.size()
+        qkv_x = qkv_x.view(B, M, 3, self.num_heads, -1)
+        qkv_x = qkv_x.permute(2, 0, 1, 3, 4)
 
         # Process text features
         y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)
@@ -175,7 +226,7 @@ class AsymmetricAttention(nn.Module):
         return qkv
     
     def flash_attention(self, qkv, cu_seqlens, max_seqlen_in_batch, total, local_dim):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(mm.get_autocast_device(self.device), enabled=False):
             out: torch.Tensor = flash_attn_varlen_qkvpacked_func(
                 qkv,
                 cu_seqlens=cu_seqlens,
@@ -186,8 +237,9 @@ class AsymmetricAttention(nn.Module):
             return out.view(total, local_dim)
         
     def sdpa_attention(self, qkv):
-        q, k, v = rearrange(qkv, '(b s) t h d -> t b h s d', b=1)
-        with torch.autocast("cuda", enabled=False):
+        q, k, v = qkv.unbind(dim=1)
+        q, k, v = [x.permute(1, 0, 2).unsqueeze(0) for x in (q, k, v)]
+        with torch.autocast(mm.get_autocast_device(self.device), enabled=False):
             with sdpa_kernel(backends):
                 out = F.scaled_dot_product_attention(
                     q, 
@@ -197,11 +249,14 @@ class AsymmetricAttention(nn.Module):
                     dropout_p=0.0, 
                     is_causal=False
                     )
-                return rearrange(out, 'b h s d -> s (b h d)')
+                return out.permute(2, 0, 1, 3).reshape(out.shape[2], -1)
         
     def sage_attention(self, qkv):
-        q, k, v = rearrange(qkv, '(b s) t h d -> t b h s d', b=1)
-        with torch.autocast("cuda", enabled=False):
+        #q, k, v = rearrange(qkv, '(b s) t h d -> t b h s d', b=1)
+        q, k, v = qkv.unbind(dim=1)
+        q, k, v = [x.permute(1, 0, 2).unsqueeze(0) for x in (q, k, v)]
+
+        with torch.autocast(mm.get_autocast_device(self.device), enabled=False):
             out = sageattn(
                 q, 
                 k, 
@@ -210,12 +265,15 @@ class AsymmetricAttention(nn.Module):
                 dropout_p=0.0, 
                 is_causal=False
                 )
-            return rearrange(out, 'b h s d -> s (b h d)')
+            #print(out.shape)
+            #out = rearrange(out, 'b h s d -> s (b h d)')
+            return out.permute(2, 0, 1, 3).reshape(out.shape[2], -1)
         
     def comfy_attention(self, qkv):
         from comfy.ldm.modules.attention import optimized_attention
-        q, k, v = rearrange(qkv, '(b s) t h d -> t b h s d', b=1)
-        with torch.autocast("cuda", enabled=False):
+        q, k, v = qkv.unbind(dim=1)
+        q, k, v = [x.permute(1, 0, 2).unsqueeze(0) for x in (q, k, v)]
+        with torch.autocast(mm.get_autocast_device(self.device), enabled=False):
             out = optimized_attention(
                 q, 
                 k, 
@@ -237,11 +295,7 @@ class AsymmetricAttention(nn.Module):
         max_seqlen_in_batch: int,
         valid_token_indices: torch.Tensor,
     ):
-        _, cp_size = get_cp_rank_size()
-        N = cp_size * M
-        assert self.num_heads % cp_size == 0
-        local_heads = self.num_heads // cp_size
-        local_dim = local_heads * self.head_dim
+        local_dim = self.num_heads * self.head_dim
         total = qkv.size(0)
 
         if self.attention_mode == "flash_attn":
@@ -253,19 +307,13 @@ class AsymmetricAttention(nn.Module):
         elif self.attention_mode == "comfy":
             out = self.comfy_attention(qkv)
         
-        x, y = pad_and_split_xy(out, valid_token_indices, B, N, L, qkv.dtype)
-        assert x.size() == (B, N, local_dim)
+        x, y = pad_and_split_xy(out, valid_token_indices, B, M, L, qkv.dtype)
+        assert x.size() == (B, M, local_dim)
         assert y.size() == (B, L, local_dim)
 
-        x = x.view(B, N, local_heads, self.head_dim)
-        x = all_to_all_collect_heads(x)  # (B, M, dim_x = num_heads * head_dim)
+        x = x.view(B, M, self.num_heads, self.head_dim)
+        x = x.view(x.size(0), x.size(1), x.size(2) * x.size(3))
         x = self.proj_x(x)  # (B, M, dim_x)
-
-        if is_cp_active():
-            y = all_gather(y)  # (cp_size * B, L, local_heads * head_dim)
-            y = rearrange(
-                y, "(G B) L D -> B L (G D)", G=cp_size, D=local_dim
-            )  # (B, L, dim_x)
         y = self.proj_y(y)  # (B, L, dim_y)
         return x, y
 
@@ -317,7 +365,6 @@ class AsymmetricAttention(nn.Module):
         )
         return x, y
 
-#@torch.compile(disable=not COMPILE_MMDIT_BLOCK)
 class AsymmetricJointBlock(nn.Module):
     def __init__(
         self,
@@ -441,7 +488,6 @@ class AsymmetricJointBlock(nn.Module):
         return y
 
 
-#@torch.compile(disable=not COMPILE_FINAL_LAYER)
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
@@ -586,7 +632,6 @@ class AsymmDiTJoint(nn.Module):
         """
         return self.x_embedder(x)  # Convert BcTHW to BCN
 
-    #@torch.compile(disable=not COMPILE_MMDIT_BLOCK)
     def prepare(
         self,
         x: torch.Tensor,
@@ -596,46 +641,28 @@ class AsymmDiTJoint(nn.Module):
     ):
         """Prepare input and conditioning embeddings."""
         #("X", x.shape)
-        with torch.profiler.record_function("x_emb_pe"):
-            # Visual patch embeddings with positional encoding.
-            T, H, W = x.shape[-3:]
-            pH, pW = H // self.patch_size, W // self.patch_size
-            x = self.embed_x(x)  # (B, N, D), where N = T * H * W / patch_size ** 2
-            assert x.ndim == 3
-            B = x.size(0)
+        # Visual patch embeddings with positional encoding.
+        T, H, W = x.shape[-3:]
+        pH, pW = H // self.patch_size, W // self.patch_size
+        x = self.embed_x(x)  # (B, N, D), where N = T * H * W / patch_size ** 2
+        assert x.ndim == 3
 
-        with torch.profiler.record_function("rope_cis"):
-            # Construct position array of size [N, 3].
-            # pos[:, 0] is the frame index for each location,
-            # pos[:, 1] is the row index for each location, and
-            # pos[:, 2] is the column index for each location.
-            pH, pW = H // self.patch_size, W // self.patch_size
-            N = T * pH * pW
-            assert x.size(1) == N
-            pos = create_position_matrix(
-                T, pH=pH, pW=pW, device=x.device, dtype=torch.float32
-            )  # (N, 3)
-            rope_cos, rope_sin = compute_mixed_rotation(
-                freqs=self.pos_frequencies, pos=pos
-            )  # Each are (N, num_heads, dim // 2)
+        # Construct position array of size [N, 3].
+        # pos[:, 0] is the frame index for each location,
+        # pos[:, 1] is the row index for each location, and
+        # pos[:, 2] is the column index for each location.
+        pH, pW = H // self.patch_size, W // self.patch_size
+        N = T * pH * pW
+        assert x.size(1) == N
+        pos = create_position_matrix(T, pH=pH, pW=pW, device=x.device, dtype=torch.float32)  # (N, 3)
+        rope_cos, rope_sin = compute_mixed_rotation(freqs=self.pos_frequencies, pos=pos)  # Each are (N, num_heads, dim // 2)
 
-        with torch.profiler.record_function("t_emb"):
-            # Global vector embedding for conditionings.
-            c_t = self.t_embedder(1 - sigma)  # (B, D)
+        # Global vector embedding for conditionings.
+        c_t = self.t_embedder(1 - sigma)  # (B, D)
 
-        with torch.profiler.record_function("t5_pool"):
-            # Pool T5 tokens using attention pooler
-            # Note y_feat[1] contains T5 token features.
-            # print("B", B)
-            # print("t5 feat shape",t5_feat.shape)
-            # print("t5 mask shape", t5_mask.shape)
-            assert (
-                t5_feat.size(1) == self.t5_token_length
-            ), f"Expected L={self.t5_token_length}, got {t5_feat.shape} for y_feat."
-            t5_y_pool = self.t5_y_embedder(t5_feat, t5_mask)  # (B, D)
-            assert (
-                t5_y_pool.size(0) == B
-            ), f"Expected B={B}, got {t5_y_pool.shape} for t5_y_pool."
+        # Pool T5 tokens using attention pooler
+        # Note y_feat[1] contains T5 token features.
+        t5_y_pool = self.t5_y_embedder(t5_feat, t5_mask)  # (B, D)
 
         c = c_t + t5_y_pool
 
@@ -672,21 +699,6 @@ class AsymmDiTJoint(nn.Module):
             )
         del y_mask
 
-        cp_rank, cp_size = get_cp_rank_size()
-        N = x.size(1)
-        M = N // cp_size
-        assert (
-            N % cp_size == 0
-        ), f"Visual sequence length ({x.shape[1]}) must be divisible by cp_size ({cp_size})."
-
-        if cp_size > 1:
-            x = x.narrow(1, cp_rank * M, M)
-
-            assert self.num_heads % cp_size == 0
-            local_heads = self.num_heads // cp_size
-            rope_cos = rope_cos.narrow(1, cp_rank * local_heads, local_heads)
-            rope_sin = rope_sin.narrow(1, cp_rank * local_heads, local_heads)
-
         for i, block in enumerate(self.blocks):
             x, y_feat = block(
                 x,
@@ -698,11 +710,7 @@ class AsymmDiTJoint(nn.Module):
             )  # (B, M, D), (B, L, D)
         del y_feat  # Final layers don't use dense text features.
 
-        x = self.final_layer(x, c)  # (B, M, patch_size ** 2 * out_channels)
-
-        patch = x.size(2)
-        x = all_gather(x) 
-        x = rearrange(x, "(G B) M P -> B (G M) P", G=cp_size, P=patch)
+        x = self.final_layer(x, c)  # (B, M, patch_size ** 2 * out_channels)    
         x = rearrange(
             x,
             "B (T hp wp) (p1 p2 c) -> B c T (hp p1) (wp p2)",

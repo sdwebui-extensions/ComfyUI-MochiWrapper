@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from ..dit.joint_model.context_parallel import get_cp_rank_size, local_shard
-from ..vae.cp_conv import cp_pass_frames, gather_all_frames
+#from ..dit.joint_model.context_parallel import get_cp_rank_size
+#from ..vae.cp_conv import cp_pass_frames, gather_all_frames
 
 
 def cast_tuple(t, length=1):
@@ -33,7 +33,7 @@ class SafeConv3d(torch.nn.Conv3d):
     NOTE: No support for padding along time dimension.
           Input must already be padded along time.
     """
-
+    @torch.compiler.disable()
     def forward(self, input):
         memory_count = torch.prod(torch.tensor(input.shape)).item() * 2 / 1024**3
         if memory_count > 2:
@@ -125,8 +125,6 @@ class ContextParallelConv3d(SafeConv3d):
         )
 
     def forward(self, x: torch.Tensor):
-        cp_rank, cp_world_size = get_cp_rank_size()
-
         # Compute padding amounts.
         context_size = self.kernel_size[0] - 1
         if self.causal:
@@ -139,30 +137,8 @@ class ContextParallelConv3d(SafeConv3d):
         # Apply padding.
         assert self.padding_mode == "replicate"  # DEBUG
         mode = "constant" if self.padding_mode == "zeros" else self.padding_mode
-        if self.context_parallel and cp_world_size == 1:
-            x = F.pad(x, (0, 0, 0, 0, pad_front, pad_back), mode=mode)
-        else:
-            if cp_rank == 0:
-                x = F.pad(x, (0, 0, 0, 0, pad_front, 0), mode=mode)
-            elif cp_rank == cp_world_size - 1 and pad_back:
-                x = F.pad(x, (0, 0, 0, 0, 0, pad_back), mode=mode)
-
-        if self.context_parallel and cp_world_size == 1:
-            return super().forward(x)
-
-        if self.stride[0] == 1:
-            # Receive some frames from previous rank.
-            x = cp_pass_frames(x, context_size)
-            return super().forward(x)
-
-        # Less efficient implementation for strided convs.
-        # All gather x, infer and chunk.
-        assert (
-            x.dtype == torch.bfloat16
-        ), f"Expected x to be of type torch.bfloat16, got {x.dtype}"
-
-        x = gather_all_frames(x)  # [B, C, k - 1 + global_T, H, W]
-        return StridedSafeConv3d.forward(self, x, local_shard=True)
+        x = F.pad(x, (0, 0, 0, 0, pad_front, pad_back), mode=mode)
+        return super().forward(x)
 
 
 class Conv1x1(nn.Linear):
@@ -217,8 +193,8 @@ class DepthToSpaceTime(nn.Module):
             sw=self.spatial_expansion,
         )
 
-        cp_rank, _ = get_cp_rank_size()
-        if self.temporal_expansion > 1 and cp_rank == 0:
+        # cp_rank, _ = cp.get_cp_rank_size()
+        if self.temporal_expansion > 1: # and cp_rank == 0:
             # Drop the first self.temporal_expansion - 1 frames.
             # This is because we always want the 3x3x3 conv filter to only apply
             # to the first frame, and the first frame doesn't need to be repeated.
@@ -457,10 +433,10 @@ class CausalUpsampleBlock(nn.Module):
 
 
 def block_fn(channels, *, has_attention: bool = False, **block_kwargs):
-    attn_block = AttentionBlock(channels) if has_attention else None
+    #attn_block = AttentionBlock(channels) if has_attention else None
 
     return ResBlock(
-        channels, affine=True, attn_block=attn_block, **block_kwargs
+        channels, affine=True, attn_block=None, **block_kwargs
     )
 
 
@@ -574,6 +550,7 @@ class Decoder(nn.Module):
         nonlinearity: str = "silu",
         output_nonlinearity: str = "silu",
         causal: bool = True,
+        dtype: torch.dtype = torch.float32,
         **block_kwargs,
     ):
         super().__init__()
@@ -582,6 +559,7 @@ class Decoder(nn.Module):
         self.channel_multipliers = channel_multipliers
         self.num_res_blocks = num_res_blocks
         self.output_nonlinearity = output_nonlinearity
+        self.dtype = dtype
         assert nonlinearity == "silu"
         assert causal
 
@@ -742,18 +720,27 @@ def blend_vertical(a: torch.Tensor, b: torch.Tensor, overlap: int) -> torch.Tens
 def nearest_multiple(x: int, multiple: int) -> int:
     return round(x / multiple) * multiple
 
-
+from tqdm import tqdm
+from comfy.utils import ProgressBar
 def apply_tiled(
     fn: Callable[[torch.Tensor], torch.Tensor],
     x: torch.Tensor,
     num_tiles_w: int,
     num_tiles_h: int,
-    overlap: int = 0,  # Number of pixel of overlap between adjacent tiles.
-    # Use a factor of 2 times the latent downsample factor.
+    overlap: int = 0,  # Number of pixels of overlap between adjacent tiles.
     min_block_size: int = 1,  # Minimum number of pixels in each dimension when subdividing.
+    pbar: Optional[tqdm] = None,
+    comfy_pbar: Optional[ProgressBar] = None,
 ):
+    if pbar is None:
+        total_tiles = num_tiles_w * num_tiles_h
+        pbar = tqdm(total=total_tiles)
+        comfy_pbar = ProgressBar(total_tiles)
     if num_tiles_w == 1 and num_tiles_h == 1:
-        return fn(x)
+        result = fn(x)
+        pbar.update(1)
+        comfy_pbar.update(1)
+        return result
 
     assert (
         num_tiles_w & (num_tiles_w - 1) == 0
@@ -776,10 +763,10 @@ def apply_tiled(
 
         assert num_tiles_w % 2 == 0, f"num_tiles_w={num_tiles_w} must be even"
         left = apply_tiled(
-            fn, left, num_tiles_w // 2, num_tiles_h, overlap, min_block_size
+            fn, left, num_tiles_w // 2, num_tiles_h, overlap, min_block_size, pbar, comfy_pbar
         )
         right = apply_tiled(
-            fn, right, num_tiles_w // 2, num_tiles_h, overlap, min_block_size
+            fn, right, num_tiles_w // 2, num_tiles_h, overlap, min_block_size, pbar, comfy_pbar
         )
         if left is None or right is None:
             return None
@@ -798,10 +785,10 @@ def apply_tiled(
 
         assert num_tiles_h % 2 == 0, f"num_tiles_h={num_tiles_h} must be even"
         top = apply_tiled(
-            fn, top, num_tiles_w, num_tiles_h // 2, overlap, min_block_size
+            fn, top, num_tiles_w, num_tiles_h // 2, overlap, min_block_size, pbar, comfy_pbar
         )
         bottom = apply_tiled(
-            fn, bottom, num_tiles_w, num_tiles_h // 2, overlap, min_block_size
+            fn, bottom, num_tiles_w, num_tiles_h // 2, overlap, min_block_size, pbar, comfy_pbar
         )
         if top is None or bottom is None:
             return None
