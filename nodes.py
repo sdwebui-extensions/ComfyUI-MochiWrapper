@@ -88,8 +88,8 @@ class DownloadAndLoadMochiModel:
         # Transformer model
         model_download_path = os.path.join(folder_paths.models_dir, 'diffusion_models', 'mochi')
         model_path = os.path.join(model_download_path, model)
-        if (not os.path.exists(model_path)) and os.path.exists(os.path.join(folder_paths.models_dir, 'diffusion_models', 'mochi', model)):
-            model_path = os.path.join(folder_paths.models_dir, 'diffusion_models', 'mochi', model)
+        if (not os.path.exists(model_path)) and os.path.exists(os.path.join(folder_paths.cache_dir, 'diffusion_models', 'mochi', model)):
+            model_path = os.path.join(folder_paths.cache_dir, 'diffusion_models', 'mochi', model)
    
         repo_id = "kijai/Mochi_preview_comfy"
         
