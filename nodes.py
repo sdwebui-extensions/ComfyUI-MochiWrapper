@@ -1,4 +1,7 @@
 import os
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
+
 import torch
 import folder_paths
 import comfy.model_management as mm
@@ -62,12 +65,14 @@ class DownloadAndLoadMochiModel:
                     {"tooltip": "Downloads from 'https://huggingface.co/Kijai/Mochi_preview_comfy' to 'models/vae/mochi'", },
                 ),
                  "precision": (["fp8_e4m3fn","fp8_e4m3fn_fast","fp16", "fp32", "bf16"],
-                    {"default": "fp8_e4m3fn", }),
+                    {"default": "fp8_e4m3fn", "tooltip": "The precision to use for the model weights. Has no effect with GGUF models"},),
                 "attention_mode": (["sdpa","flash_attn","sage_attn", "comfy"],
                 ),
             },
             "optional": {
                 "trigger": ("CONDITIONING", {"tooltip": "Dummy input for forcing execution order",}),
+                "compile_args": ("MOCHICOMPILEARGS", {"tooltip": "Optional torch.compile arguments",}),
+                "cublas_ops": ("BOOLEAN", {"tooltip": "tested on 4090, unsure of gpu requirements, enables faster linear ops for the GGUF models, for more info:'https://github.com/aredden/torch-cublas-hgemm'",}),
             },
         }
 
@@ -77,7 +82,7 @@ class DownloadAndLoadMochiModel:
     CATEGORY = "MochiWrapper"
     DESCRIPTION = "Downloads and loads the selected Mochi model from Huggingface"
 
-    def loadmodel(self, model, vae, precision, attention_mode, trigger=None):
+    def loadmodel(self, model, vae, precision, attention_mode, trigger=None, compile_args=None, cublas_ops=False):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -125,7 +130,9 @@ class DownloadAndLoadMochiModel:
             dit_checkpoint_path=model_path,
             weight_dtype=dtype,
             fp8_fastmode = True if precision == "fp8_e4m3fn_fast" else False,
-            attention_mode=attention_mode
+            attention_mode=attention_mode,
+            compile_args=compile_args,
+            cublas_ops=cublas_ops
         )
         with (init_empty_weights() if is_accelerate_available else nullcontext()):
             vae = Decoder(
@@ -165,6 +172,9 @@ class MochiModelLoader:
             },
             "optional": {
                 "trigger": ("CONDITIONING", {"tooltip": "Dummy input for forcing execution order",}),
+                "compile_args": ("MOCHICOMPILEARGS", {"tooltip": "Optional torch.compile arguments",}),
+                "cublas_ops": ("BOOLEAN", {"tooltip": "tested on 4090, unsure of gpu requirements, enables faster linear ops for the GGUF models, for more info:'https://github.com/aredden/torch-cublas-hgemm'",}),
+           
             },
         }
     RETURN_TYPES = ("MOCHIMODEL",)
@@ -172,7 +182,7 @@ class MochiModelLoader:
     FUNCTION = "loadmodel"
     CATEGORY = "MochiWrapper"
 
-    def loadmodel(self, model_name, precision, attention_mode, trigger=None):
+    def loadmodel(self, model_name, precision, attention_mode, trigger=None, compile_args=None, cublas_ops=False):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -188,17 +198,53 @@ class MochiModelLoader:
             dit_checkpoint_path=model_path,
             weight_dtype=dtype,
             fp8_fastmode = True if precision == "fp8_e4m3fn_fast" else False,
-            attention_mode=attention_mode
+            attention_mode=attention_mode,
+            compile_args=compile_args,
+            cublas_ops=cublas_ops
         )
 
         return (model, )
 
+class MochiTorchCompileSettings:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": { 
+                "backend": (["inductor","cudagraphs"], {"default": "inductor"}),
+                "fullgraph": ("BOOLEAN", {"default": False, "tooltip": "Enable full graph mode"}),
+                "mode": (["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], {"default": "default"}),
+                "compile_dit": ("BOOLEAN", {"default": True, "tooltip": "Compiles all transformer blocks"}),
+                "compile_final_layer": ("BOOLEAN", {"default": True, "tooltip": "Enable compiling final layer."}),
+            },
+        }
+    RETURN_TYPES = ("MOCHICOMPILEARGS",)
+    RETURN_NAMES = ("torch_compile_args",)
+    FUNCTION = "loadmodel"
+    CATEGORY = "MochiWrapper"
+    DESCRIPTION = "torch.compile settings, when connected to the model loader, torch.compile of the selected layers is attempted. Requires Triton and torch 2.5.0 is recommended"
+
+    def loadmodel(self, backend, fullgraph, mode, compile_dit, compile_final_layer):
+
+        compile_args = {
+            "backend": backend,
+            "fullgraph": fullgraph,
+            "mode": mode,
+            "compile_dit": compile_dit,
+            "compile_final_layer": compile_final_layer,
+        }
+
+        return (compile_args, )
+    
 class MochiVAELoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": { 
                 "model_name": (folder_paths.get_filename_list("vae"), {"tooltip": "The name of the checkpoint (vae) to load."}),
+            },
+            "optional": {
+                "torch_compile_args": ("MOCHICOMPILEARGS", {"tooltip": "Optional torch.compile arguments",}),
+                "precision": (["fp16", "fp32", "bf16"], {"default": "bf16"}),
             },
         }
 
@@ -207,11 +253,13 @@ class MochiVAELoader:
     FUNCTION = "loadmodel"
     CATEGORY = "MochiWrapper"
 
-    def loadmodel(self, model_name):
+    def loadmodel(self, model_name, torch_compile_args=None, precision="bf16"):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         mm.soft_empty_cache()
+
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
         vae_path = folder_paths.get_full_path_or_raise("vae", model_name)
 
@@ -230,16 +278,22 @@ class MochiVAELoader:
                     nonlinearity="silu",
                     output_nonlinearity="silu",
                     causal=True,
+                    dtype=dtype,
                 )
         vae_sd = load_torch_file(vae_path)
         if is_accelerate_available:
-            for key in vae_sd:
-                set_module_tensor_to_device(vae, key, dtype=torch.float32, device=device, value=vae_sd[key])
+            for name, param in vae.named_parameters():
+                set_module_tensor_to_device(vae, name, dtype=dtype, device=offload_device, value=vae_sd[name])
         else:
             vae.load_state_dict(vae_sd, strict=True)
-            vae.eval().to(torch.bfloat16).to("cpu")
+            vae.to(dtype).to(offload_device)
+        vae.eval()
         del vae_sd
 
+        if torch_compile_args is not None:
+            vae.to(device)
+            vae = torch.compile(vae, fullgraph=torch_compile_args["fullgraph"], mode=torch_compile_args["mode"], dynamic=False, backend=torch_compile_args["backend"])
+    
         return (vae,)
     
 class MochiTextEncode:
@@ -265,24 +319,29 @@ class MochiTextEncode:
         load_device = mm.text_encoder_device()
         offload_device = mm.text_encoder_offload_device()
 
-        clip.tokenizer.t5xxl.pad_to_max_length = True
-        clip.tokenizer.t5xxl.max_length = max_tokens
-        clip.cond_stage_model.t5xxl.return_attention_masks = True
-        clip.cond_stage_model.t5xxl.enable_attention_masks = True
-        clip.cond_stage_model.t5_attention_mask = True
-        clip.cond_stage_model.to(load_device)
-        tokens = clip.tokenizer.t5xxl.tokenize_with_weights(prompt, return_word_ids=True)
-        
         try:
-            embeds, _, attention_mask = clip.cond_stage_model.t5xxl.encode_token_weights(tokens)
+            clip.tokenizer.t5xxl.pad_to_max_length = True
+            clip.tokenizer.t5xxl.max_length = max_tokens
+            clip.cond_stage_model.t5xxl.return_attention_masks = True
+            clip.cond_stage_model.t5xxl.enable_attention_masks = True
+            clip.cond_stage_model.t5_attention_mask = True
+            clip.cond_stage_model.to(load_device)
+            tokens = clip.tokenizer.t5xxl.tokenize_with_weights(prompt, return_word_ids=True)
+            try:
+                embeds, _, attention_mask = clip.cond_stage_model.t5xxl.encode_token_weights(tokens)
+            except:
+                NotImplementedError("Failed to get attention mask from T5, is your ComfyUI up to date?")
         except:
-            NotImplementedError("Failed to get attention mask from T5, is your ComfyUI up to date?")
-
+            clip.cond_stage_model.to(offload_device)
+            tokens = clip.tokenizer.tokenize_with_weights(prompt, return_word_ids=True)
+            embeds, _, attention_mask = clip.cond_stage_model.encode_token_weights(tokens)
+        
         if embeds.shape[1] > 256:
             raise ValueError(f"Prompt is too long, max tokens supported is {max_tokens} or less, got {embeds.shape[1]}")
         embeds *= strength
         if force_offload:
             clip.cond_stage_model.to(offload_device)
+            mm.soft_empty_cache()
 
         t5_embeds = {
             "embeds": embeds,
@@ -307,28 +366,53 @@ class MochiSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 #"batch_cfg": ("BOOLEAN", {"default": False, "tooltip": "Enable batched cfg"}),
             },
+            "optional": {
+                "cfg_schedule": ("FLOAT", {"forceInput": True, "tooltip": "Override cfg schedule with a list of ints"}),
+                "opt_sigmas": ("SIGMAS", {"tooltip": "Override sigma schedule and steps"}),
+            }
         }
 
     RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("model", "samples",)
+    RETURN_NAMES = ("samples",)
     FUNCTION = "process"
     CATEGORY = "MochiWrapper"
 
-    def process(self, model, positive, negative, steps, cfg, seed, height, width, num_frames):
+    def process(self, model, positive, negative, steps, cfg, seed, height, width, num_frames, cfg_schedule=None, opt_sigmas=None):
         mm.soft_empty_cache()
 
-        device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
+        if opt_sigmas is not None:
+            sigma_schedule = opt_sigmas.tolist()
+            steps = int(len(sigma_schedule))
+            sigma_schedule.extend([0.0])
+            logging.info(f"Using sigma_schedule: {sigma_schedule}")
+        else:
+            sigma_schedule = linear_quadratic_schedule(steps, 0.025)
+
+        if cfg_schedule is None:
+            cfg_schedule = [cfg] * steps
+        else:
+            logging.info(f"Using cfg schedule: {cfg_schedule}")
+
+        #For compatibility with Comfy CLIPTextEncode
+        if not isinstance(positive, dict):
+            positive = {
+                "embeds": positive[0][0],
+                "attention_mask": positive[0][1]["attention_mask"].bool(),
+                }
+        if not isinstance(negative, dict):
+            negative = {
+                "embeds": negative[0][0],
+                "attention_mask": negative[0][1]["attention_mask"].bool(),
+                }
 
         args = {
             "height": height,
             "width": width,
             "num_frames": num_frames,
             "mochi_args": {
-                "sigma_schedule": linear_quadratic_schedule(steps, 0.025),
-                "cfg_schedule": [cfg] * steps,
+                "sigma_schedule": sigma_schedule,
+                "cfg_schedule": cfg_schedule,
                 "num_inference_steps": steps,
-                "batch_cfg": False,
             },
             "positive_embeds": positive,
             "negative_embeds": negative,
@@ -367,7 +451,7 @@ class MochiDecode:
         offload_device = mm.unet_offload_device()
         intermediate_device = mm.intermediate_device()
         samples = samples["samples"]
-        samples = samples.to(torch.bfloat16).to(device)
+        samples = samples.to(vae.dtype).to(device)
 
         B, C, T, H, W = samples.shape
 
@@ -468,6 +552,74 @@ class MochiDecode:
 
         return (frames,)
 
+class MochiDecodeSpatialTiling:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "vae": ("MOCHIVAE",),
+            "samples": ("LATENT", ),
+            "enable_vae_tiling": ("BOOLEAN", {"default": False, "tooltip": "Drastically reduces memory use but may introduce seams"}),
+            "num_tiles_w": ("INT", {"default": 4, "min": 2, "max": 64, "step": 2, "tooltip": "Number of horizontal tiles"}),
+            "num_tiles_h": ("INT", {"default": 4, "min": 2, "max": 64, "step": 2, "tooltip": "Number of vertical tiles"}),
+            "overlap": ("INT", {"default": 16, "min": 0, "max": 256, "step": 1, "tooltip": "Number of pixel of overlap between adjacent tiles"}),
+            "min_block_size": ("INT", {"default": 1, "min": 1, "max": 256, "step": 1, "tooltip": "Minimum number of pixels in each dimension when subdividing"}),
+            "per_batch": ("INT", {"default": 6, "min": 1, "max": 256, "step": 1, "tooltip": "Number of samples per batch, in latent space (6 frames in 1 latent)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "decode"
+    CATEGORY = "MochiWrapper"
+
+    def decode(self, vae, samples, enable_vae_tiling, num_tiles_w, num_tiles_h, overlap, 
+               min_block_size, per_batch):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        intermediate_device = mm.intermediate_device()
+        samples = samples["samples"]
+        samples = samples.to(vae.dtype).to(device)
+
+        B, C, T, H, W = samples.shape
+        
+        vae.to(device)
+        decoded_list = []
+        with torch.autocast(mm.get_autocast_device(device), dtype=vae.dtype):
+            if enable_vae_tiling:
+                from .mochi_preview.vae.model import apply_tiled
+                
+                pbar = ProgressBar(T // per_batch)
+                for i in range(0, T, per_batch):
+                    if i >= T:
+                        break
+                    end_index = min(i + per_batch, T)
+                    logging.info(f"Decoding {end_index - i} samples with tiling...")
+                    chunk = samples[:, :, i:end_index, :, :]
+                    frames = apply_tiled(vae, chunk, num_tiles_w = num_tiles_w, num_tiles_h = num_tiles_h, overlap=overlap, min_block_size=min_block_size)
+                    logging.info(f"Decoded {frames.shape[2]} frames from {end_index - i} samples")
+                    pbar.update(1)
+                    # Blend the first and last frames of each pair
+                    if len(decoded_list) > 0:
+                        previous_frames = decoded_list[-1]
+                        blended_frames = (previous_frames[:, :, -1:, :, :] + frames[:, :, :1, :, :]) / 2
+                        decoded_list[-1][:, :, -1:, :, :] = blended_frames
+                    
+                    decoded_list.append(frames)
+                frames = torch.cat(decoded_list, dim=2)
+            else:
+                logging.info("Decoding without tiling...")
+                frames = vae(samples)
+        
+        vae.to(offload_device)
+
+        frames = frames.float()
+        frames = (frames + 1.0) / 2.0
+        frames.clamp_(0.0, 1.0)
+
+        frames = rearrange(frames, "b c t h w -> (t b) h w c").to(intermediate_device)
+
+        return (frames,)
+
 
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadMochiModel": DownloadAndLoadMochiModel,
@@ -476,6 +628,8 @@ NODE_CLASS_MAPPINGS = {
     "MochiTextEncode": MochiTextEncode,
     "MochiModelLoader": MochiModelLoader,
     "MochiVAELoader": MochiVAELoader,
+    "MochiDecodeSpatialTiling": MochiDecodeSpatialTiling,
+    "MochiTorchCompileSettings": MochiTorchCompileSettings
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadMochiModel": "(Down)load Mochi Model",
@@ -484,4 +638,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MochiTextEncode": "Mochi TextEncode",
     "MochiModelLoader": "Mochi Model Loader",
     "MochiVAELoader": "Mochi VAE Loader",
+    "MochiDecodeSpatialTiling": "Mochi VAE Decode Spatial Tiling",
+    "MochiTorchCompileSettings": "Mochi Torch Compile Settings"
     }
